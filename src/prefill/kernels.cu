@@ -1021,4 +1021,94 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
     check("gate_attn");
 }
 
+// ---------------------------------------------------------------- peer prompt share without P2P (STRATA_PEER_HOST_PREFILL)
+// The peer gets the activations as FP16 and sends back one weighted partial sum per token instead of a row per
+// routed expert: ~1/5 of the bytes over the peer's link.
+namespace {
+__global__ void f32_to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = hf_sat(x[i]);
+}
+__global__ void f16_to_f32_kernel(const uint4* __restrict__ x, float4* __restrict__ y, int64_t n8) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
+        const uint4 v = x[i];   // 8 halves, one 16-byte read of (mapped) memory
+        const __half2* h = reinterpret_cast<const __half2*>(&v);
+        const float2 a = __half22float2(h[0]), b = __half22float2(h[1]), c = __half22float2(h[2]), d = __half22float2(h[3]);
+        y[2 * i] = make_float4(a.x, a.y, b.x, b.y);
+        y[2 * i + 1] = make_float4(c.x, c.y, d.x, d.y);
+    }
+}
+__global__ void peer_row_weights_kernel(const int32_t* __restrict__ slot, const float* __restrict__ w, int64_t n,
+                                        int64_t rows_local, float* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t r = slot[i];
+    if (r >= rows_local) out[r - rows_local] = w[i];   // one (token, k) per row
+}
+// One block per token of the group: part[t] += sum of its rows (in u_rows order) times their weights.
+__global__ void peer_reduce_kernel(float* __restrict__ part, const float* __restrict__ rows,
+                                   const float* __restrict__ wrow, const int32_t* __restrict__ u_tok,
+                                   const int32_t* __restrict__ u_beg, const int32_t* __restrict__ u_rows) {
+    const int64_t u = blockIdx.x;
+    const int64_t t = u_tok[u];
+    const int b = u_beg[u], e = u_beg[u + 1];
+    float4* p = reinterpret_cast<float4*>(part) + t * (N / 4);
+    for (int d = threadIdx.x; d < N / 4; d += blockDim.x) {
+        float4 acc = p[d];
+        for (int j = b; j < e; ++j) {
+            const int64_t r = u_rows[j];
+            const float wj = wrow[r];
+            const float4 v = reinterpret_cast<const float4*>(rows)[r * (N / 4) + d];
+            acc.x = fmaf(wj, v.x, acc.x); acc.y = fmaf(wj, v.y, acc.y);
+            acc.z = fmaf(wj, v.z, acc.z); acc.w = fmaf(wj, v.w, acc.w);
+        }
+        p[d] = acc;
+    }
+}
+__global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                        const float* __restrict__ w, int64_t rows_local, const float* __restrict__ part,
+                                        const float* __restrict__ shared, const float* __restrict__ sg,
+                                        float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int64_t r = slot[t * 10 + k];
+        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[r * N + d], s);
+    }
+    bo[i] = s + part[i] + shared[i] * sigm(sg[t]);
+}
+}  // namespace
+void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    f32_to_f16_kernel<<<(unsigned) std::min<int64_t>((n + 255) / 256, 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    check("f32_to_f16");
+}
+void f16_to_f32_wide(const uint16_t* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const int64_t n8 = n / 8;   // callers pass multiples of N (8-aligned)
+    f16_to_f32_kernel<<<(unsigned) std::min<int64_t>((n8 + 255) / 256, 4096), 256, 0, (cudaStream_t) stream>>>(
+        (const uint4*) x, (float4*) y, n8);
+    check("f16_to_f32_wide");
+}
+void peer_row_weights(const int32_t* slot, const float* w, int64_t n, int64_t rows_local, float* out, void* stream) {
+    if (n <= 0) return;
+    peer_row_weights_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(slot, w, n, rows_local, out);
+    check("peer_row_weights");
+}
+void peer_reduce(float* part, const float* rows, const float* wrow, const int32_t* u_tok, const int32_t* u_beg,
+                 const int32_t* u_rows, int64_t n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    peer_reduce_kernel<<<(unsigned) n_tok, 128, 0, (cudaStream_t) stream>>>(part, rows, wrow, u_tok, u_beg, u_rows);
+    check("peer_reduce");
+}
+void moe_combine_peer(const float* D, const int32_t* slot, const float* w, int64_t rows_local, const float* part,
+                      const float* shared, const float* sg, float* bo, int64_t T, void* stream) {
+    moe_combine_peer_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(D, slot, w, rows_local, part, shared,
+                                                                               sg, bo, T);
+    check("moe_combine_peer");
+}
+
 }  // namespace strata::prefill

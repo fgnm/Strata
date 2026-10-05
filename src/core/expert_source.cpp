@@ -1437,7 +1437,8 @@ bool FileExpertSource::pin_cache_complement(
         lend_from_slot = -1;
     }
 
-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+    // the plan below leaves the additional pairs out as well (only STRATA_PEER_DEDUP passes any)
+    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots;
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
@@ -1747,7 +1748,9 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     }
     const size_t total = (size_t) n * (size_t) blob;
     void* p = nullptr;
-    if (cudaHostAlloc(&p, total, cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
+    // multi-GPU: portable with a peer, which copies its evicted experts in here (STRATA_PEER_DEDUP)
+    if (cudaHostAlloc(&p, total, peer_portable() ? cudaHostAllocPortable : cudaHostAllocDefault) == cudaSuccess &&
+        p != nullptr) {
         xstage_pinned_ = true;
     } else {
         (void) cudaGetLastError();

@@ -1389,6 +1389,23 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def monitor_gpus(cfg: dict) -> list[int]:
+    """The cards the Monitor reads: gpu_list's, plus the --peer-device card (its CUDA number counts in the config's
+    CUDA_VISIBLE_DEVICES, else in gpu_list), numbered as nvidia-smi numbers them."""
+    cards = gpu_list(cfg)
+    args = [str(x) for x in cfg.get("args") or []]
+    if "--peer-device" not in args or args.index("--peer-device") + 1 >= len(args):
+        return cards
+    try:
+        peer = int(args[args.index("--peer-device") + 1])
+        env = str((cfg.get("env") or {}).get("CUDA_VISIBLE_DEVICES", ""))
+        visible = [int(x) for x in env.split(",") if x.strip() != ""] or cards
+        card = visible[peer] if 0 <= peer < len(visible) else peer
+    except ValueError:
+        return cards
+    return (cards or [0]) + ([card] if card not in cards else [])
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -1578,8 +1595,13 @@ def child_env(cfg: dict) -> dict:
 def vision_env(cfg: dict, env: dict) -> dict:
     """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
-    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
+    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes - except with --peer-device: the
+    encoder runs on the primary card alone (it uses no other, and a CUDA context on the peer takes ~100 MiB of its
+    expert cache)."""
     dev = (cfg.get("vision") or {}).get("cuda_device")
+    if dev is None and "--peer-device" in [str(x) for x in cfg.get("args") or []]:
+        visible = [x.strip() for x in str(env.get("CUDA_VISIBLE_DEVICES", "")).split(",") if x.strip()]
+        dev = visible[0] if visible else (gpu_list(cfg) or [0])[0]
     if dev is None:
         return env
     env = dict(env)
@@ -4070,7 +4092,7 @@ def main() -> int:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    svc.gpu_indices = monitor_gpus(cfg)                 # ... or every card of a layer split (issue #112) or a peer
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view

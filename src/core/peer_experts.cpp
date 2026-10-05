@@ -296,6 +296,35 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
     if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
     On on(device_);
+    // STRATA_PEER_DEDUP: `out` is in no RAM copy, so before its slot is overwritten it goes into an exchange buffer;
+    // commit_exchanges (once these copies have landed) moves it into `in`'s place.  A swap past the buffers waits.
+    if (ram_ != nullptr && ram_->complement_ready()) {
+        struct Staged { int32_t layer, in, out; int64_t q; };
+        std::vector<Staged> staged;
+        std::vector<Swap> kept;
+        kept.reserve(swaps.size());
+        for (const Swap& s : swaps) {
+            if (!ram_->has_resident(s.layer, s.in) || ram_->has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+            const int64_t q = q_base_ + (int64_t) staged.size();
+            if (q >= ram_->exchange_capacity()) continue;
+            const int32_t slot = res_[(size_t) (s.layer * n_expert_ + s.out)];
+            if (slot < 0) continue;
+            if (!ck(cudaMemcpyAsync(ram_->exchange_buffer(q), cache_.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
+                                    cudaMemcpyDeviceToHost, refill_), "evict to RAM", err))
+                return false;
+            staged.push_back({s.layer, s.in, s.out, q});
+            kept.push_back(s);
+        }
+        if (!staged.empty()) {
+            if (!ck(cudaStreamSynchronize(refill_), "evict to RAM", err)) return false;
+            for (const Staged& x : staged)
+                if (!ram_->stage_exchange(x.layer, x.in, x.out, x.q)) {
+                    err = "peer experts: cannot stage the RAM exchange of layer " + std::to_string(x.layer);
+                    return false;
+                }
+        }
+        swaps.swap(kept);
+    }
     for (const Swap& s : swaps) {
         const size_t in = (size_t) (s.layer * n_expert_ + s.in), out = (size_t) (s.layer * n_expert_ + s.out);
         const int32_t slot = res_[out];
@@ -311,15 +340,24 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
 
-void PeerExperts::apply_pending(bool wait) {
-    if (pending_.empty()) return;
+bool PeerExperts::apply_pending(bool wait) {
+    if (pending_.empty()) return true;
     {
         On on(device_);
         if (wait) cudaEventSynchronize(refill_ev_);
-        else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;
+        else if (cudaEventQuery(refill_ev_) != cudaSuccess) return false;
     }
     for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
     pending_.clear();
+    return true;
+}
+
+std::vector<std::pair<int32_t, int32_t>> PeerExperts::pairs() const {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    out.reserve((size_t) resident_);
+    for (size_t i = 0; i < res_.size(); ++i)
+        if (res_[i] >= 0) out.emplace_back((int32_t) (i / (size_t) n_expert_), (int32_t) (i % (size_t) n_expert_));
+    return out;
 }
 
 }  // namespace strata::core

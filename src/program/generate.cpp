@@ -209,10 +209,11 @@ using Clock = std::chrono::steady_clock;
 // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
 // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
 // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
+// `q_cap` >= 0: the exchange buffers this tier may use (STRATA_PEER_DEDUP: the peer's start there).
 template <class Swap>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
                           const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-                          cudaStream_t stream) {
+                          cudaStream_t stream, int64_t q_cap = -1) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -221,7 +222,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
     for (const Swap& s : swaps) {
         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
         const int64_t q = (int64_t) staged.size();
-        if (q >= src.exchange_capacity()) continue;
+        if (q >= (q_cap >= 0 ? std::min(q_cap, src.exchange_capacity()) : src.exchange_capacity())) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
         if (cudaMemcpyAsync(src.exchange_buffer(q), cache.device_slot(slot),
@@ -4544,15 +4545,22 @@ int main(int argc, char** argv) {
             const int64_t k = plan_lend(chunk);
             if (k > 0) lend_from = xcache.slots() - k;
         }
-        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
-                                                    o.resident_budget, &profile);
+        // STRATA_PEER_DEDUP=1: the peer's experts stay out of the RAM copy (its swaps exchange with it, see
+        // PeerExperts::set_resident).  The prompt path reads them from the file unless the peer computes them there
+        // (with P2P, or STRATA_PEER_HOST_PREFILL=1 without).
+        const bool peer_dedup = peer.valid() && std::getenv("STRATA_PEER_DEDUP") != nullptr &&
+                                std::strcmp(std::getenv("STRATA_PEER_DEDUP"), "0") != 0;
+        const std::vector<std::pair<int32_t, int32_t>> peer_pairs =
+            peer_dedup ? peer.pairs() : std::vector<std::pair<int32_t, int32_t>>{};
+        bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_pairs, lend_from,
+                                                    o.resident_headroom, o.resident_budget, &profile);
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
             // budget path (sized by the RAM alone) instead of none: the misses outside it read the same file bytes
             // the mmap fallback reads, so the answers are unchanged.  Nothing pinned: the old fallback below.
             whole_err = err;
-            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, {}, -1, o.resident_headroom,
+            resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, peer_pairs, -1, o.resident_headroom,
                                                    strata::core::FileExpertSource::kResidentWhatFits, &profile);
             if (resident_ok)
                 std::fprintf(stderr, "strata generate: WARNING: the whole resident RAM mode does not fit (%s); %.2f "
@@ -4564,10 +4572,17 @@ int main(int argc, char** argv) {
                 err = whole_err + "; " + err;
         }
         if (resident_ok) {
-            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+            const int64_t primary_q = std::min<int64_t>(o.adapt_swaps, 96);
+            const int64_t peer_q = peer_dedup ? std::min<int64_t>(o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps
+                                                                                          : o.adapt_swaps, 96) : 0;
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(primary_q + peer_q, err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
+            }
+            if (peer_dedup) {
+                peer.set_resident(&src, primary_q);
+                std::fprintf(stderr, "strata generate: peer dedup: %zu experts on GPU %d left out of the RAM copy\n",
+                             peer_pairs.size(), peer.device());
             }
             std::fprintf(stderr, "strata generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
                                  "cache; adaptive swaps %s\n",
@@ -5468,8 +5483,15 @@ int main(int argc, char** argv) {
             }
         };
         auto apply_pending = [&](bool wait) {
-            if (peer.valid()) peer.apply_pending(wait);
-            if (pending.empty()) return;
+            // STRATA_PEER_DEDUP: the RAM copy's staged exchanges (the primary's and the peer's) commit together, so
+            // only once both tiers' copies have landed.  Without it the peer stages none: as before.
+            const bool peer_done = !peer.valid() || peer.apply_pending(wait);
+            const bool shared = peer.valid() && peer.exchanges_ram();
+            if (pending.empty()) {
+                if (shared && peer_done) src.commit_exchanges();
+                return;
+            }
+            if (shared && !peer_done) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -5515,7 +5537,8 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream,
+                                      std::min<int64_t>(o.adapt_swaps, 96))) return false;
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)

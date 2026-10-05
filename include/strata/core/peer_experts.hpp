@@ -50,6 +50,14 @@ public:
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
+    /// The (layer, expert) pairs the peer holds now (STRATA_PEER_DEDUP: left out of the resident RAM copy).
+    std::vector<std::pair<int32_t, int32_t>> pairs() const;
+
+    /// STRATA_PEER_DEDUP: the resident RAM copy holds only what neither GPU holds, so a swap's evicted expert is
+    /// copied back into RAM in the swapped-in one's place (as resident_stage_swaps does for the primary), with the
+    /// exchange buffers from `q_base` on (the primary's swaps use the ones below).  Null: no exchange.
+    void set_resident(FileExpertSource* ram, int64_t q_base) { ram_ = ram; q_base_ = q_base; }
+    bool exchanges_ram() const { return ram_ != nullptr; }
 
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
@@ -71,7 +79,8 @@ public:
     /// or -1) nor the peer holds into the peer's least-used slots.  Copies run on the peer's refill stream; a
     /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
-    void apply_pending(bool wait);
+    /// Admits the swaps whose copies have landed; true when none is left in flight.
+    bool apply_pending(bool wait);
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
@@ -88,7 +97,9 @@ private:
     int64_t n_layers_ = 0, n_expert_ = 0;
     ExpertCache cache_;
     ExpertSource* src_ = nullptr;
-    std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
+    FileExpertSource* ram_ = nullptr;                 ///< STRATA_PEER_DEDUP: the resident RAM copy to exchange with
+    int64_t q_base_ = 0;
+    std::vector<int32_t> res_;                       ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;

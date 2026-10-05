@@ -68,6 +68,19 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+// ---- the peer's prompt share without P2P (STRATA_PEER_HOST_PREFILL): either side may be mapped host memory
+/// y[i] = fp16(x[i]), saturated
+void f32_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+/// y[i] = float(x[i]) in 16-byte reads (n a multiple of 8)
+void f16_to_f32_wide(const uint16_t* x, float* y, int64_t n, void* stream);
+/// out[slot[i] - rows_local] = w[i] for the rows from rows_local on (the peer's)
+void peer_row_weights(const int32_t* slot, const float* w, int64_t n, int64_t rows_local, float* out, void* stream);
+/// part[u_tok[u], :] += sum over j in [u_beg[u], u_beg[u+1]) of wrow[u_rows[j]] * rows[u_rows[j], :]  (n_tok tokens)
+void peer_reduce(float* part, const float* rows, const float* wrow, const int32_t* u_tok, const int32_t* u_beg,
+                 const int32_t* u_rows, int64_t n_tok, void* stream);
+/// moe_combine over the rows below rows_local, plus the peer's partial sums part[t, :]
+void moe_combine_peer(const float* D, const int32_t* slot, const float* w, int64_t rows_local, const float* part,
+                      const float* shared, const float* sg, float* bo, int64_t T, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
