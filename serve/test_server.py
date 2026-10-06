@@ -1694,6 +1694,21 @@ class GpuChoice(unittest.TestCase):
             self.assertEqual(sc, {0: 128 * 2350.0, 1: 64 * 2000.0, 2: 128 * 2350.0})
             self.assertIsNone(hip_speed_scores([0, 1, 2, 3], root=d))      # a card the topology does not have
 
+    def test_chat_template_path(self):
+        # the config's "chat_template" wins; a missing one refuses the start; else the tokenizer's, else serve's
+        import tempfile
+        from serve.server import chat_template_path
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            own = d / "own.jinja"
+            own.write_text("x")
+            self.assertEqual(chat_template_path({"chat_template": str(own)}, d), own)
+            with self.assertRaises(SystemExit):
+                chat_template_path({"chat_template": str(d / "missing.jinja")}, d)
+            self.assertEqual(chat_template_path({}, d), ROOT / "serve/chat_template.jinja")
+            (d / "chat_template.jinja").write_text("y")
+            self.assertEqual(chat_template_path({}, d), d / "chat_template.jinja")
+
     def test_vision_device(self):
         # #408: the image encoder on its own card; the engine's environment stays as it was
         from serve.server import child_env, vision_env
