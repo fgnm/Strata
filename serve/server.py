@@ -2565,6 +2565,19 @@ def engine_binary(exe: str, cfg: dict | None = None) -> str:
     return exe
 
 
+def chat_template_path(cfg: dict, tpath: Path) -> Path:
+    """The chat template to render with: the config's "chat_template" (a file path) when set, else the model's own
+    (exported with its tokenizer), else the original model's.  A configured file that is missing refuses the start."""
+    own = cfg.get("chat_template")
+    if own:
+        p = Path(own)
+        if not p.is_file():
+            raise SystemExit(f"[strata] config chat_template: {own} is not a file")
+        return p
+    tpl = tpath / "chat_template.jinja"
+    return tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
+
+
 def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
@@ -6942,9 +6955,10 @@ def main() -> int:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    tpl = chat_template_path(cfg, tpath)
+    if cfg.get("chat_template"):
+        print(f"[strata] chat template: {tpl}", flush=True)
+    svc = Service(engine, tok, ChatTemplate(tpl),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
