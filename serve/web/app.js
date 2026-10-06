@@ -556,6 +556,14 @@ function markdown(text) {
 // ------------------------------------------------------------------ Chat
 const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// the server's own sampling defaults (the config's "sampling" block, through /props) replace the built-in ones;
+// what was saved in this browser still wins, and Reset loads the server's
+fetch("props", {headers: headers()}).then((r) => r.ok ? r.json() : null).then((p) => {
+  const d = p && p.default_generation_settings && p.default_generation_settings.params;
+  if (!d) return;
+  for (const k of ["temperature", "top_p", "top_k"]) if (typeof d[k] === "number") DEFAULTS[k] = d[k];
+  settings = {...DEFAULTS, ...store.get("sampling", {})};
+}).catch(() => { /* an older server: the built-in defaults stay */ });
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
