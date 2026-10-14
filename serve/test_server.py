@@ -1720,6 +1720,22 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
         plain = {"gpu": [0, 1], "vision": {"exe": "v"}}
         self.assertIs(vision_env(plain, env), env)          # no cuda_device: the engine's environment, unchanged
+        # --peer-device: the encoder on the primary card only (the config's CUDA_VISIBLE_DEVICES names both)
+        peer = {"gpu": 0, "args": ["--peer-device", "1"], "env": {"CUDA_VISIBLE_DEVICES": "0,1"}, "vision": {"exe": "v"}}
+        penv = child_env(peer)
+        self.assertEqual(penv["CUDA_VISIBLE_DEVICES"], "0,1")
+        self.assertEqual(vision_env(peer, penv)["CUDA_VISIBLE_DEVICES"], "0")
+
+    def test_monitor_gpus(self):
+        """The Monitor reads the --peer-device card too, numbered through the config's CUDA_VISIBLE_DEVICES."""
+        from serve.server import monitor_gpus
+        self.assertEqual(monitor_gpus({"gpu": 0, "args": []}), [0])
+        self.assertEqual(monitor_gpus({"gpu": 0, "args": ["--peer-device", "1"],
+                                       "env": {"CUDA_VISIBLE_DEVICES": "0,1"}}), [0, 1])
+        self.assertEqual(monitor_gpus({"gpu": 0, "args": ["--peer-device", "1"],
+                                       "env": {"CUDA_VISIBLE_DEVICES": "2,0"}}), [0])      # the peer is card 0 itself
+        self.assertEqual(monitor_gpus({"gpu": [0, 1], "args": ["--peer-device", "1"]}), [0, 1])
+        self.assertEqual(monitor_gpus({"gpu": 0, "args": ["--peer-device", "x"]}), [0])
 
     def test_hip_ordinal(self):
         """#325: on Windows the HIP ordinal setup resolved wins over the config's "gpu" (an iGPU takes HIP's 0)."""

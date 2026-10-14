@@ -2743,7 +2743,10 @@ bool FileExpertSource::pin_cache_complement(
         lend_from_slot = -1;
     }
 
-    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
+    // STRATA_PEER_DEDUP (keep_lend_with_additional): the additional pairs are a peer's, which lends nothing, so the
+    // primary's lend region stays - the plan below leaves the additional pairs out of it as well
+    const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots &&
+                      (additional_gpu_pairs.empty() || lend_with_additional_);
     uint64_t budget = std::numeric_limits<uint64_t>::max();
     if (bytes > 0 || lend) {
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
@@ -3290,7 +3293,10 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
                           complement_host_ && complement_device_ && complement_bytes_ > 0;
     const size_t total = (size_t) n * (size_t) blob;
     void* p = nullptr;
-    if (cudaHostAlloc(&p, total, eligible ? cudaHostAllocMapped : cudaHostAllocDefault) == cudaSuccess && p != nullptr) {
+    // multi-GPU: portable with a peer, which copies its evicted experts in here (STRATA_PEER_DEDUP)
+    const unsigned portable = peer_portable() ? cudaHostAllocPortable : 0u;
+    if (cudaHostAlloc(&p, total, (eligible ? cudaHostAllocMapped : cudaHostAllocDefault) | portable) == cudaSuccess &&
+        p != nullptr) {
         xstage_pinned_ = true;
     } else {
         (void) cudaGetLastError();
