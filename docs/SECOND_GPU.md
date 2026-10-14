@@ -179,6 +179,18 @@ context write them. The tier size is manual for now (`--peer-reserve-mib`,
 `--peer-slots`); automatic sizing on small cards wants the buffer lending of
 #216 and is a follow-up.
 
+### The resident RAM mode with a peer (`STRATA_PEER_DEDUP=1`, opt-in)
+
+With `--resident-experts` the RAM copy holds every expert the primary does not hold, so the peer's experts sit in
+RAM a second time. `STRATA_PEER_DEDUP=1` leaves them out: the RAM copy holds only what neither card holds, and
+the primary's lend region (the prompt path's borrowed slots) stays in it. A peer swap copies its evicted expert
+back into RAM in the swapped-in one's place, through the exchange buffers after the primary's (the primary's
+swaps work the same way); both cards' exchanges commit once both cards' copies have landed. The prompt path does
+not read the peer's experts from RAM: the peer computes their rows (over P2P, or without it through mapped host
+memory). Without P2P, a layer off the MMQ prompt path reads them from the files. Not measured on this release
+yet; on 0.1.39 (RTX 3090 Ti + RTX 3060 on PCIe 3.0 x4, 32 GB RAM, IQ2_XS, 262K context, `--kv-resident 32768`)
+the RAM copy took 20 GiB with it, with decode at 118-129 t/s.
+
 ## The resident RAM mode with the helper caches
 
 `--resident-experts` (the low-RAM mode) works with the helper caches: the

@@ -350,6 +350,7 @@ static const char* pipe_dbg_env(const char* name) {
 // owning card's cache on that card's stream: `locate(layer)` names them (cache, stream, device; -1 = CUDA0).  Reading
 // a later stage's slot number out of CUDA0's cache copied another expert's bytes into RAM - the resident mode with a
 // split then computed some experts from the wrong weights after the first adaptive swaps (garbage output).
+// `q_cap` >= 0: the exchange buffers this tier may use (STRATA_PEER_DEDUP: the peer's start there).
 struct SwapHome {
     strata::core::ExpertCache* cache;
     cudaStream_t stream;
@@ -357,8 +358,9 @@ struct SwapHome {
 };
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
-                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
+                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate, int64_t q_cap = -1) {
     if (!src.complement_ready() || swaps.empty()) return true;
+    const int64_t q_end = q_cap >= 0 ? std::min(q_cap, src.exchange_capacity()) : src.exchange_capacity();
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
     std::vector<SwapHome> used;
@@ -367,7 +369,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     for (const Swap& s : swaps) {
         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
         const int64_t q = (int64_t) staged.size();
-        if (q >= src.exchange_capacity()) continue;
+        if (q >= q_end) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
         const SwapHome home = locate(s.layer);
@@ -7686,6 +7688,21 @@ int main(int argc, char** argv) {
             }
             src.stage_lend_regions(std::move(stage_lends));
         }
+        // STRATA_PEER_DEDUP=1: the peer's experts stay out of the RAM copy as well (its swaps exchange with it, see
+        // PeerExperts::set_resident), and the primary's lend region stays.  The prompt path never reads them here:
+        // the peer computes its experts' rows (with P2P, or through mapped host memory without).  --peer-device and a
+        // layer split are refused together, so `stage_pairs` is empty here.
+        const bool peer_dedup = peer.valid() && [] {
+            const char* v = std::getenv("STRATA_PEER_DEDUP");
+            return v != nullptr && v[0] != 0 && std::strcmp(v, "0") != 0;
+        }();
+        size_t peer_left_out = 0;
+        if (peer_dedup) {
+            const std::vector<std::pair<int32_t, int32_t>> pp = peer.pairs();
+            peer_left_out = pp.size();
+            stage_pairs.insert(stage_pairs.end(), pp.begin(), pp.end());
+            src.keep_lend_with_additional(true);
+        }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
@@ -7742,10 +7759,19 @@ int main(int argc, char** argv) {
             // blocking tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays
             if (o.adapt_async && !src.exchange_pinned())
                 adapt_async_off("the exchange buffers could not be page-locked");
-            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+            // STRATA_PEER_DEDUP: the peer's swaps take the buffers after the primary's (--adapt-async is off with a peer)
+            const int64_t primary_q = std::min<int64_t>(o.adapt_swaps, 96);
+            const int64_t peer_q = peer_dedup ? std::min<int64_t>(o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps
+                                                                                          : o.adapt_swaps, 96) : 0;
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(primary_q + peer_q, err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
+            }
+            if (peer_dedup) {
+                if (o.adapt_every > 0 && o.adapt_swaps > 0) peer.set_resident(&src, primary_q);
+                std::fprintf(stderr, "strata generate: STRATA_PEER_DEDUP: %zu experts on GPU %d left out of the RAM copy%s\n",
+                             peer_left_out, peer.device(),
+                             peer.exchanges_ram() ? "; the peer's swaps exchange with it" : "");
             }
             std::fprintf(stderr, "strata generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
                                  "cache; adaptive swaps %s\n",
@@ -8303,6 +8329,12 @@ int main(int argc, char** argv) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
+                if (const char* dd = std::getenv("STRATA_PEER_DEDUP"); dd != nullptr && dd[0] != 0 && std::strcmp(dd, "0") != 0)
+                    std::fprintf(stderr, "strata serve: WARNING: STRATA_PEER_DEDUP left the peer's %lld experts out of the "
+                                         "RAM copy, so without the peer's prompt share every prompt reads them from the "
+                                         "files. Raise --peer-reserve-mib (or STRATA_PF_PEER_STREAM=0, which frees the "
+                                         "peer's streaming ring), or turn STRATA_PEER_DEDUP off\n",
+                                 (long long) peer.resident());
                 err.clear();
             }
         }
@@ -9562,8 +9594,15 @@ int main(int argc, char** argv) {
             return r;
         };
         auto apply_pending = [&](bool wait) {
-            if (peer.valid()) peer.apply_pending(wait);
-            if (pending.empty()) return;
+            // STRATA_PEER_DEDUP: the RAM copy's staged exchanges (the primary's and the peer's) commit together, so
+            // only once both tiers' copies have landed.  Without it the peer stages none: as before.
+            const bool peer_done = !peer.valid() || peer.apply_pending(wait);
+            const bool shared = peer.valid() && peer.exchanges_ram();
+            if (pending.empty()) {
+                if (shared && peer_done) src.commit_exchanges();
+                return;
+            }
+            if (shared && !peer_done) return;
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -9696,6 +9735,9 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            // STRATA_PEER_DEDUP: the peer's swaps too - their exchanges are staged in the same RAM copy, and an expert it
+            // is still swapping in must not be picked here as well
+            if (peer.exchanges_ram() && peer.busy()) return true;
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -9737,7 +9779,8 @@ int main(int argc, char** argv) {
                 }
                 return {&xcache, adapt_stream, -1};
             };
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of,
+                                      peer.exchanges_ram() ? std::min<int64_t>(o.adapt_swaps, 96) : -1)) return false;
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;

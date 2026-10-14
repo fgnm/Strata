@@ -2647,6 +2647,23 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
+def monitor_gpus(cfg: dict) -> list[int]:
+    """The cards the Monitor reads: gpu_list's, plus the --peer-device card (its CUDA number counts in the config's
+    CUDA_VISIBLE_DEVICES, else in gpu_list), numbered as nvidia-smi numbers them."""
+    cards = gpu_list(cfg)
+    args = [str(x) for x in cfg.get("args") or []]
+    if "--peer-device" not in args or args.index("--peer-device") + 1 >= len(args):
+        return cards
+    try:
+        peer = int(args[args.index("--peer-device") + 1])
+        env = str((cfg.get("env") or {}).get("CUDA_VISIBLE_DEVICES", ""))
+        visible = [int(x) for x in env.split(",") if x.strip() != ""] or cards
+        card = visible[peer] if 0 <= peer < len(visible) else peer
+    except ValueError:
+        return cards
+    return (cards or [0]) + ([card] if card not in cards else [])
+
+
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
     --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
@@ -2932,8 +2949,13 @@ def hip_env_guard(env: dict, cfg: dict) -> list[str]:
 def vision_env(cfg: dict, env: dict) -> dict:
     """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
-    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
+    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes - except with --peer-device: the
+    encoder runs on the primary card alone (it uses no other, and a CUDA context on the peer takes ~100 MiB of its
+    expert cache)."""
     dev = (cfg.get("vision") or {}).get("cuda_device")
+    if dev is None and "--peer-device" in [str(x) for x in cfg.get("args") or []] and cfg.get("backend") != "hip":
+        visible = [x.strip() for x in str(env.get("CUDA_VISIBLE_DEVICES", "")).split(",") if x.strip()]
+        dev = visible[0] if visible else (gpu_list(cfg) or [0])[0]
     if dev is None:
         return env
     env = dict(env)
@@ -7089,7 +7111,7 @@ def main() -> int:
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
-    svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    svc.gpu_indices = monitor_gpus(cfg)                 # ... or every card of a layer split (issue #112) or a peer
     if a.engine == "strata" and groups:                 # replicas: every card of every group
         svc.gpu_indices = [c for g in groups for c in g]
         svc.gpu_index = svc.gpu_indices[0]

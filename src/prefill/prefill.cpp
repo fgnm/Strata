@@ -2727,7 +2727,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                    if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    // multi-GPU: computed on (or, with P2P, read from) the peer.  Without P2P a layer off the MMQ path
+                    // (the peer computes on MMQ only) cannot read the peer's slot: its experts are streamed like the rest
+                    if (m.pp && m.pp->peer && m.pp->peer->has(l, e) &&
+                        (m.pp->p2p || (mmq_plan().any && mmq_plan().layer[(size_t) l])))
+                        continue;
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer

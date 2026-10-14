@@ -692,6 +692,9 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// STRATA_PEER_DEDUP: `additional_gpu_pairs` are a --peer-device card's (it lends nothing to the prompt path), so
+    /// the single lend region stays on beside them.  Set before `pin_cache_complement`.
+    void keep_lend_with_additional(bool on) { lend_with_additional_ = on; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1007,6 +1010,7 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+    bool lend_with_additional_ = false;        ///< keep_lend_with_additional (STRATA_PEER_DEDUP)
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
