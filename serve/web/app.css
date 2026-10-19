@@ -122,6 +122,24 @@ main { flex: 1; min-height: 0; display: flex; }
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }
 .req-totals:empty { display: none; }
 .cc-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.pslots-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.pslots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--st-s-3); }
+.pslot { border: 1px solid var(--st-line-soft); border-radius: 12px; padding: var(--st-s-3); display: flex; flex-direction: column;
+         gap: var(--st-s-2); min-width: 0; }
+.pslot[data-state="idle"] { opacity: .7; }
+.pslot__head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
+.pslot__name { font-weight: var(--st-fw-medium); }
+.pslot__body { display: flex; align-items: center; gap: var(--st-s-3); }
+.pslot__gauge { position: relative; width: 92px; height: 92px; flex: none; }
+.pslot__gauge .st-gauge { width: 92px; height: 92px; }
+.pslot__gauge .st-gauge__fill { transition: stroke-dasharray 400ms var(--st-ease); }
+.pslot__gauge .st-gauge__fill[data-tone="warn"] { stroke: var(--st-warn); }
+.pslot__pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+              font-weight: var(--st-fw-black); font-size: var(--st-fs-lg); font-variant-numeric: tabular-nums; }
+.pslot__facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px var(--st-s-3); margin: 0; min-width: 0;
+                font-size: var(--st-fs-sm); }
+.pslot__facts dt { color: var(--st-ink-muted); }
+.pslot__facts dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .cc-bars { display: grid; grid-template-columns: 1fr 1fr; gap: var(--st-s-2) var(--st-s-6); }
 .cc-bars[hidden] { display: none; }
 .cc-note { margin: 0; }
