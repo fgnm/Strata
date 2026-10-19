@@ -194,8 +194,72 @@ function render(m) {
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor") renderSlots(live, eng.max_context || 0);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
+}
+
+// #465: "parallel": N in the run config - one card per engine batch slot (live.slots), each with its own context
+// fill: every slot's session is sized for the engine's whole --max-context
+const SLOT_STATE = {idle: ["", "Idle"], reading: ["st-badge--reading", "Reading"], decoding: ["st-badge--generating", "Generating"]};
+const ARC = 235.6;                                 // the gauges' 270° arc on r=50 (the Context fill card's)
+function slotCard() {
+  const el = document.createElement("div");
+  el.className = "pslot";
+  el.innerHTML = `<div class="pslot__head"><span class="pslot__name"></span><span class="st-badge"></span></div>
+    <div class="pslot__body">
+      <div class="pslot__gauge">
+        <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                  stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+          <circle class="st-gauge__fill" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
+                  stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+        </svg>
+        <div class="pslot__pct"></div>
+      </div>
+      <dl class="pslot__facts"></dl>
+    </div>`;
+  return el;
+}
+function renderSlots(live, ctx) {
+  const slots = live.parallel ? live.slots || [] : [];
+  $("pslots-card").hidden = !slots.length;
+  if (!slots.length) return;
+  // with slots on, the conversation cache sits right under them (the layout without them is left as it is)
+  const cc = $("cc-card");
+  if (cc.previousElementSibling !== $("pslots-card")) $("pslots-card").after(cc);
+  const busy = slots.filter((s) => s.state !== "idle").length;
+  // live.outside_slots: running but in no slot - the one request alone on the solo path, or one waiting its turn
+  $("pslots-sum").textContent = `${fmt(busy)} of ${fmt(slots.length)} in use` +
+    (live.outside_slots ? ` · ${fmt(live.outside_slots)} more running alone or waiting` : "");
+  const grid = $("pslots-grid");
+  while (grid.children.length < slots.length) grid.append(slotCard());   // built once, then updated: the arcs animate
+  while (grid.children.length > slots.length) grid.lastElementChild.remove();
+  slots.forEach((s, k) => {
+    const el = grid.children[k], idle = s.state === "idle";
+    const [cls, text] = SLOT_STATE[s.state] || ["", s.state];
+    const used = idle ? s.held_tokens || 0 : (s.prompt_tokens || 0) + (s.generated || 0);
+    const frac = ctx ? Math.min(1, used / ctx) : 0;
+    el.dataset.state = s.state;
+    el.querySelector(".pslot__name").textContent = `Slot ${s.slot + 1}`;
+    const badge = el.querySelector(".st-badge");
+    badge.className = `st-badge ${cls}`;
+    badge.textContent = text;
+    const fill = el.querySelector(".st-gauge__fill");
+    fill.setAttribute("stroke-dasharray", `${(ARC * frac).toFixed(1)} 314.2`);
+    fill.style.opacity = ARC * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
+    fill.dataset.tone = frac >= 0.8 ? "warn" : "";
+    el.querySelector(".pslot__pct").textContent = `${Math.round(frac * 100)}%`;
+    const rows = idle
+      ? [["Context", ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : kfmt(used)], ["Kept", used ? "for its next turn" : "empty"]]
+      : [["Context", ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : kfmt(used)],
+         ["Prompt", kfmt(s.prompt_tokens)], ["Output", fmt(s.generated)],
+         ["Speed", s.tok_s != null ? `${fmt(s.tok_s, 1)} tok/s` : "–"],
+         ["Time", s.elapsed_s != null ? `${fmt(s.elapsed_s, 1)} s` : "–"]];
+    // --batch-mtp: the share of the slot's MTP proposals the last request that ended in it kept (BDONE's counts)
+    if (s.last_mtp_offered) rows.push(["Last MTP", `${fmt((100 * s.last_mtp_accepted) / s.last_mtp_offered)}% of ${fmt(s.last_mtp_offered)} drafts`]);
+    el.querySelector(".pslot__facts").innerHTML = rows.map(([k2, v]) => `<dt>${esc(k2)}</dt><dd>${esc(v)}</dd>`).join("");
+  });
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -217,7 +281,10 @@ function renderConvCache(c) {
     $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
     $("cc-mem-bar").style.width = pct(c.bytes, budget);
   }
-  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
+  const reuse = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
+  // the one-line summary on top (the card can sit right under the parallel slots): what is parked, then the reuse
+  const held = c.enabled ? `${fmt(c.parked)} / ${fmt(c.slots)} parked · ${gb(c.bytes)} / ${gb(c.budget_mib * 1048576)} GB` : "";
+  $("cc-sum").textContent = [held, reuse].filter(Boolean).join(" · ");
   const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
   const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
   facts($("cc-facts"), [

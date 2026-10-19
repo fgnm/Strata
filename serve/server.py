@@ -954,6 +954,7 @@ class StrataEngine:
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        self.slot_mtp: list[tuple[int, int] | None] = [None] * self.batch   # /metrics: the last BDONE's (taken, offered)
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
         # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -1338,10 +1339,17 @@ class StrataEngine:
         return None
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        """`BDONE <slot> <produced> <finish> <ms> [<accepted> <offered>]` into this request's figures.  The last two
+        (--batch-mtp) are the slot's MTP proposals: added to the admission DONE's own (its solo decode, if any)."""
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+            if len(f) >= 7 and f[5].isdigit() and f[6].isdigit():
+                self.last["drafts_accepted"] = int(self.last.get("drafts_accepted") or 0) + int(f[5])
+                self.last["drafts_offered"] = int(self.last.get("drafts_offered") or 0) + int(f[6])
+                slot = int(f[1]) if f[1].isdigit() else -1
+                if 0 <= slot < len(getattr(self, "slot_mtp", [])):
+                    self.slot_mtp[slot] = (int(f[5]), int(f[6]))
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -1908,17 +1916,22 @@ class StrataEngine:
                                         bool(self.slot_held[b]), self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
-        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
+        """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding; and the MTP
+        proposals (taken, offered) of the last request that ended in it (--batch-mtp; absent before one has)."""
         now, view = time.time(), []
+        mtp = getattr(self, "slot_mtp", [])
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
-                continue
-            ft = r.get("first_token")
-            view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
-                         "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
-                         "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+                v = {"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])}
+            else:
+                ft = r.get("first_token")
+                v = {"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
+                     "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+                     "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None}
+            if b < len(mtp) and mtp[b] is not None:
+                v["last_mtp_accepted"], v["last_mtp_offered"] = mtp[b]
+            view.append(v)
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -4699,6 +4712,9 @@ def carry_leg(carry: dict, leg: dict) -> None:
     replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
     carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
     carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    for key in ("drafts_accepted", "drafts_offered"):     # the slot leg's MTP proposals (BDONE, --batch-mtp)
+        if leg.get(key) is not None:
+            carry[key] = carry.get(key, 0) + int(leg[key])
     carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
     if leg.get("prompt_read") is not None:
         carry.setdefault("prompt_read", int(leg["prompt_read"]))
@@ -4710,6 +4726,9 @@ def add_carry(carry: dict, last: dict) -> dict:
     out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
            "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
            "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    for key in ("drafts_accepted", "drafts_offered"):
+        if key in carry:
+            out[key] = int(last.get(key) or 0) + carry[key]
     if "prompt_read" in carry:
         out["prompt_read"] = carry["prompt_read"]
     return out

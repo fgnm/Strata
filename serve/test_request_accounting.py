@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, add_carry, carry_leg, request_timings, serve
+from serve.server import ByteTokenizer, EngineDied, Service, StrataEngine, add_carry, carry_leg, request_timings, serve
 from serve.test_server import ThinkingEngine
 
 
@@ -203,6 +203,32 @@ class SlotLegAccounting(unittest.TestCase):
         total = add_carry(carry, {"generated": 5, "decode_ms": 50.0, "prompt_ms": 1.0})
         self.assertEqual((total["generated"], total["decode_ms"], total["prompt_ms"]), (35, 450.0, 50.0))
         self.assertNotIn("prompt_read", total)
+
+    def test_slot_mtp_proposals_count(self):
+        # --batch-mtp: BDONE's last two fields are the slot's proposals (taken, offered), added to the admission DONE's
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.batch = 4
+        eng.slot_live, eng.slot_held, eng.slot_mtp = [None] * 4, [[]] * 4, [None] * 4
+        eng.last = {"generated": 1, "decode_ms": 0.0, "drafts_accepted": 8, "drafts_offered": 9, "finish": "stop"}
+        eng._apply_bdone("BDONE 2 713 stop 22800.5 412 600".split())
+        self.assertEqual((eng.last["generated"], eng.last["finish"]), (713, "stop"))
+        self.assertEqual((eng.last["drafts_accepted"], eng.last["drafts_offered"]), (420, 609))
+        # /metrics: the slot keeps its last request's own proposals (not the admission's), the others have none yet
+        view = eng.slots_view()
+        self.assertEqual((view[2]["last_mtp_accepted"], view[2]["last_mtp_offered"]), (412, 600))
+        self.assertNotIn("last_mtp_offered", view[0])
+        # an engine without the fields (or the pipelined groups, which run no slot drafts) leaves them as they were
+        eng.last = {"generated": 1, "drafts_accepted": 0, "drafts_offered": 0}
+        eng._apply_bdone("BDONE 0 50 length 900.0".split())
+        self.assertEqual((eng.last["drafts_accepted"], eng.last["drafts_offered"]), (0, 0))
+
+    def test_slot_leg_proposals_carry_to_the_solo_leg(self):
+        carry = {}
+        carry_leg(carry, {"generated": 100, "decode_ms": 1500.0, "drafts_accepted": 60, "drafts_offered": 80})
+        total = add_carry(carry, {"generated": 20, "decode_ms": 200.0, "drafts_accepted": 30, "drafts_offered": 40})
+        self.assertEqual((total["drafts_accepted"], total["drafts_offered"]), (90, 120))
+        total = add_carry({}, {"generated": 5, "drafts_accepted": 3, "drafts_offered": 4})   # no slot leg
+        self.assertEqual((total["drafts_accepted"], total["drafts_offered"]), (3, 4))
 
     def test_prompt_n_is_what_was_read(self):
         # the slot already held the whole prompt: 1 token read, the conversation cache off (reused 0)

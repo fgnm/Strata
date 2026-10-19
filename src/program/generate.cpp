@@ -10733,6 +10733,7 @@ int main(int argc, char** argv) {
             bool draft_ready = false;
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
+            int64_t drafts = 0, accepted = 0;   ///< --batch-mtp: this request's proposals in the slot, offered / taken
             Clock::time_point t0;
             // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
@@ -11016,6 +11017,11 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
+                if (batch_mtp) {   // each slot-window offers one proposal (BDONE says the request's own)
+                    BSlot& sa = bs[(size_t) active[a]];
+                    ++sa.drafts;
+                    sa.accepted += keep[active[a]] - 1;
+                }
             }
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
@@ -11027,7 +11033,8 @@ int main(int argc, char** argv) {
                                          "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
                                  (long long) pos[first[t]]);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    std::printf("BDONE %d %lld nonfinite %.1f %lld %lld\n", b, (long long) sl.produced, ms,
+                                (long long) sl.accepted, (long long) sl.drafts);
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
@@ -11044,7 +11051,8 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin, ms,
+                                    (long long) sl.accepted, (long long) sl.drafts);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
